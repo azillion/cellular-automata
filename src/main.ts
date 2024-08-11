@@ -1,28 +1,204 @@
 import "./style.css";
 // tsignore declaration error
 import * as dat from 'dat.gui';
-let renderTime = performance.now();
 
-// TODO: Add BVH support
-//
-//
-// NOTTODO: We won't be adding motion blur for now
+const GRID_SIZE = 512;
+const NUM_STATES = 4;
 
-export async function initWebGPU(canvas: HTMLCanvasElement) {
+let properties = {
+    evolutionSpeed: 1,
+    initialDensity: 0.3,
+    raysPerCell: 8,
+    maxBounces: 4,
+    reinitialize: () => { }
+};
+
+function getInitComputeShaderCode(width: number, height: number) {
+    return `
+    struct Cell {
+        state: u32,
+        color: vec3<f32>,
+    }
+
+    @group(0) @binding(0) var<storage, read_write> cells: array<Cell>;
+
+    const GRID_WIDTH: u32 = ${width};
+    const GRID_HEIGHT: u32 = ${height};
+    const NUM_STATES: u32 = ${NUM_STATES};
+    const INITIAL_DENSITY: f32 = ${properties.initialDensity};
+
+    fn hash(state: u32) -> u32 {
+        var x = state;
+        x = x ^ (x << 13u);
+        x = x ^ (x >> 17u);
+        x = x ^ (x << 5u);
+        return x;
+    }
+
+    fn random(seed: u32) -> f32 {
+        return f32(hash(seed)) / 4294967295.0;
+    }
+
+    @compute @workgroup_size(16, 16)
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+        let index = id.y * GRID_WIDTH + id.x;
+        if (index >= GRID_WIDTH * GRID_HEIGHT) {
+            return;
+        }
+
+        let seed = hash(index + id.x * 1237u + id.y * 3571u);
+        
+        if (random(seed) < INITIAL_DENSITY) {
+            let state = 1u + (seed % (NUM_STATES - 1u));
+            let hue = f32(state) / f32(NUM_STATES);
+            let color = vec3<f32>(hue, 1.0, 0.8);  // HSV to RGB (simplified)
+            cells[index] = Cell(state, color);
+        } else {
+            cells[index] = Cell(0u, vec3<f32>(0.0, 0.0, 0.0));
+        }
+    }
+    `;
+}
+
+function getComputeShaderCode(width: number, height: number) {
+    return `
+struct Cell {
+    state: u32,
+    color: vec3<f32>,
+}
+
+@group(0) @binding(0) var<storage, read_write> cells: array<Cell>;
+@group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
+
+const GRID_WIDTH: u32 = ${width};
+const GRID_HEIGHT: u32 = ${height};
+const NUM_STATES: u32 = ${NUM_STATES};
+const RAYS_PER_CELL: u32 = ${properties.raysPerCell};
+const MAX_BOUNCES: u32 = ${properties.maxBounces};
+
+fn hash(state: u32) -> u32 {
+    var x = state;
+    x = x ^ (x << 13u);
+    x = x ^ (x >> 17u);
+    x = x ^ (x << 5u);
+    return x;
+}
+
+fn random(state: ptr<function, u32>) -> f32 {
+    *state = hash(*state);
+    return f32(*state) / 4294967295.0;
+}
+
+fn getCellIndex(x: u32, y: u32) -> u32 {
+    return (y % GRID_HEIGHT) * GRID_WIDTH + (x % GRID_WIDTH);
+}
+
+fn evolveCell(index: u32) -> Cell {
+    let x = index % GRID_WIDTH;
+    let y = index / GRID_WIDTH;
+    var neighborCount: u32 = 0;
+    var newState: u32 = cells[index].state;
+
+    for (var dy: i32 = -1; dy <= 1; dy++) {
+        for (var dx: i32 = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            let neighborX = (x + u32(dx) + GRID_WIDTH) % GRID_WIDTH;
+            let neighborY = (y + u32(dy) + GRID_HEIGHT) % GRID_HEIGHT;
+            let neighborIndex = getCellIndex(neighborX, neighborY);
+            if (cells[neighborIndex].state > 0u) {
+                neighborCount++;
+            }
+        }
+    }
+
+    // Simple cellular automata rules
+    if (newState == 0u && neighborCount == 3u) {
+        newState = 1u + (hash(index) % (NUM_STATES - 1u));
+    } else if (newState > 0u && (neighborCount < 2u || neighborCount > 3u)) {
+        newState = 0u;
+    }
+
+    // Generate color based on state
+    let hue = f32(newState) / f32(NUM_STATES);
+    let color = vec3<f32>(hue, 1.0, 0.8);  // HSV to RGB (simplified)
+
+    return Cell(newState, color);
+}
+
+fn traceRay(origin: vec2<f32>, direction: vec2<f32>, seed: ptr<function, u32>) -> vec3<f32> {
+    var position = origin;
+    var color = vec3<f32>(0.0);
+    var attenuation = vec3<f32>(1.0);
+    var directionmut = direction;
+
+    for (var bounce = 0u; bounce < MAX_BOUNCES; bounce++) {
+        let cellX = u32(position.x * f32(GRID_WIDTH));
+        let cellY = u32(position.y * f32(GRID_HEIGHT));
+        let cellIndex = getCellIndex(cellX, cellY);
+
+        if (cells[cellIndex].state > 0u) {
+            color += attenuation * cells[cellIndex].color;
+            
+            // Diffuse reflection
+            let angle = random(seed) * 2.0 * 3.14159;
+            directionmut = vec2<f32>(cos(angle), sin(angle));
+            attenuation *= 0.5;
+        }
+
+        position += directionmut * vec2<f32>(1.0 / f32(GRID_WIDTH), 1.0 / f32(GRID_HEIGHT));
+
+        if (position.x < 0.0 || position.x >= 1.0 || position.y < 0.0 || position.y >= 1.0) {
+            break;
+        }
+    }
+
+    return color;
+}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.y * GRID_WIDTH + id.x;
+    if (index >= GRID_WIDTH * GRID_HEIGHT) {
+        return;
+    }
+
+    // Evolve cellular automata
+    cells[index] = evolveCell(index);
+
+    // Ray tracing
+    var pixelColor = vec3<f32>(0.0);
+    var seed = hash(index + id.x * 1237u + id.y * 3571u);
+
+    for (var i = 0u; i < RAYS_PER_CELL; i++) {
+        let origin = vec2<f32>(f32(id.x) / f32(GRID_WIDTH), f32(id.y) / f32(GRID_HEIGHT));
+        let angle = random(&seed) * 2.0 * 3.14159;
+        let direction = vec2<f32>(cos(angle), sin(angle));
+        
+        pixelColor += traceRay(origin, direction, &seed);
+    }
+
+    pixelColor /= f32(RAYS_PER_CELL);
+
+    // Store the result
+    textureStore(output, vec2<i32>(id.xy), vec4<f32>(pixelColor, 1.0));
+}
+    `;
+}
+
+
+async function initWebGPU(canvas: HTMLCanvasElement) {
     if (!navigator.gpu) {
         throw new Error("WebGPU not supported on this browser.");
     }
 
     const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) {
-        throw new Error("No appropriate GPUAdapter found.");
-    }
-
-    const device = await adapter.requestDevice();
-    const context = canvas.getContext("webgpu") as any;
+    const device = await adapter?.requestDevice()!;
+    const context = canvas.getContext("webgpu");
     const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
 
-    context.configure({
+    context?.configure({
         device,
         format: presentationFormat,
     });
@@ -30,623 +206,43 @@ export async function initWebGPU(canvas: HTMLCanvasElement) {
     return { device, context, presentationFormat };
 }
 
-const NUM_SPHERES = 12;
-const NUM_SAMPLES_PER_PIXEL = 16;
-const WIDTH = 1200;
+function createInitComputeShader(device: GPUDevice, cellsBuffer: GPUBuffer, textureSize: any) {
+    const initModule = device.createShaderModule({
+        label: "Cell Initialization Compute Shader",
+        code: getInitComputeShaderCode(textureSize.width, textureSize.height)
+    });
 
-var properties = {
-    numSpheres: NUM_SPHERES,
-    numSamplesPerPixel: NUM_SAMPLES_PER_PIXEL
-};
-
-function buildShaderCode(mainShaderCode: string) {
-    const constants = `
-const PI: f32 = 3.1415926535897932385;
-const INFINITY: f32 = 1e38;
-const SEED: vec2<f32> = vec2<f32>(69.68, 4.20);
-const MAX_DEPTH: u32 = 64;
-const NUM_SPHERES: u32 = ${properties.numSpheres};
-const NUM_SAMPLES_PER_PIXEL: u32 = ${properties.numSamplesPerPixel};
-`;
-
-    const helpers = `
-fn lerp(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
-    return a * (1.0 - t) + b * t;
-}
-
-fn degreesToRadians(degrees: f32) -> f32 {
-    return degrees * PI / 180.0;
-}
-
-fn hash(seed: vec2<u32>) -> u32 {
-    var state = seed.x;
-    state = state ^ (state << 13u);
-    state = state ^ (state >> 17u);
-    state = state ^ (state << 5u);
-    state = state * 1597334677u;
-    state = state ^ seed.y;
-    state = state * 1597334677u;
-    return state;
-}
-
-fn rand(seed: vec2<u32>) -> f32 {
-    return f32(hash(seed)) / 4294967295.0;
-}
-
-fn randMinMax(seed: vec2<u32>, min: f32, max: f32) -> f32 {
-    return min + (max - min) * rand(seed);
-}
-
-fn randVec3(seed: vec2<u32>) -> vec3<f32> {
-    return vec3<f32>(rand(seed), rand(seed + vec2<u32>(1u, 0u)), rand(seed + vec2<u32>(0u, 1u)));
-}
-
-fn randVec3MinMax(seed: vec2<u32>, min: f32, max: f32) -> vec3<f32> {
-    return vec3<f32>(randMinMax(seed, min, max), randMinMax(seed + vec2<u32>(1u, 0u), min, max), randMinMax(seed + vec2<u32>(0u, 1u), min, max));
-}
-
-fn randInUnitSphere(seed: vec2<u32>) -> vec3<f32> {
-    var tempseed = seed;
-    loop {
-        let p = randVec3MinMax(tempseed, -1.0, 1.0);
-        if length(p) < 1.0 {
-            return p;
+    const initPipeline = device.createComputePipeline({
+        layout: "auto",
+        compute: {
+            module: initModule,
+            entryPoint: "main"
         }
-        tempseed = vec2<u32>(hash(tempseed), hash(tempseed + vec2<u32>(1u, 1u)));
-    }
+    });
+
+    const initBindGroup = device.createBindGroup({
+        layout: initPipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: { buffer: cellsBuffer } }
+        ]
+    });
+
+    return { initPipeline, initBindGroup };
 }
 
-fn randInUnitDisk(seed: vec2<u32>) -> vec3<f32> {
-    var tempseed = seed;
-    loop {
-        let p = vec3<f32>(randMinMax(tempseed, -1.0, 1.0), randMinMax(tempseed + vec2<u32>(1u, 0u), -1.0, 1.0), 0.0);
-        if dot(p, p) < 1.0 {
-            return p;
-        }
-        tempseed = vec2<u32>(hash(tempseed), hash(tempseed + vec2<u32>(1u, 1u)));
-    }
-}
-
-fn randUnitVector(seed: vec2<u32>) -> vec3<f32> {
-    return normalize(randInUnitSphere(seed));
-}
-
-fn randomOnHemisphere(normal: vec3<f32>, seed: vec2<u32>) -> vec3<f32> {
-    let on_unit_sphere = randUnitVector(seed);
-    if (dot(on_unit_sphere, normal) > 0.0) { // In the same hemisphere as the normal
-        return on_unit_sphere;
-    } else {
-        return -on_unit_sphere;
-    }
-}
-
-fn reflect(v: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    return v - 2.0 * dot(v, n) * n;
-}
-
-fn reflectance(cosine: f32, ref_idx: f32) -> f32 {
-    // Use Schlick's approximation for reflectance
-    var r0 = (1.0 - ref_idx) / (1.0 + ref_idx);
-    r0 = r0 * r0;
-    return r0 + (1.0 - r0) * pow(1.0 - cosine, 5.0);
-}
-
-fn refract(uv: vec3<f32>, n: vec3<f32>, etai_over_etat: f32) -> vec3<f32> {
-    let cos_theta = min(dot(-uv, n), 1.0);
-    let r_out_perp = etai_over_etat * (uv + cos_theta * n);
-    let r_out_parallel = -sqrt(abs(1.0 - length(r_out_perp) * length(r_out_perp))) * n;
-    return r_out_perp + r_out_parallel;
-}
-
-fn nearZero(v: vec3<f32>) -> bool {
-    let s = 1e-8;
-    return (v.x > -s && v.x < s) && (v.y > -s && v.y < s) && (v.z > -s && v.z < s);
-}
-`;
-
-    const intervalShader = `
-struct Interval {
-    minI: f32,
-    maxI: f32,
-}
-
-fn createInterval(min: f32, max: f32) -> Interval {
-    return Interval(min, max);
-}
-
-fn intervalSize(i: Interval) -> f32 {
-    return i.maxI - i.minI;
-}
-
-fn intervalContains(i: Interval, x: f32) -> bool {
-    return i.minI <= x && x <= i.maxI;
-}
-
-fn intervalSurrounds(i: Interval, x: f32) -> bool {
-    return i.minI < x && x < i.maxI;
-}
-
-fn clampInterval(i: Interval, minI: f32, maxI: f32) -> f32 {
-    return min(max(i.minI, minI), maxI);
-}
-
-fn expandInterval(i: Interval, delta: f32) -> Interval {
-    let padding = delta / 2.0;
-    return Interval(i.minI - padding, i.maxI + padding);
-}
-
-const INTERVAL_EMPTY: Interval = Interval(INFINITY, -INFINITY);
-const INTERVAL_UNIVERSE: Interval = Interval(-INFINITY, INFINITY);
-`;
-
-    const aabbShader = `
-struct AABB {
-    x: Interval,
-    y: Interval,
-    z: Interval,
-}
-
-fn createAABBXYZ(x: Interval, y: Interval, z: Interval) -> AABB {
-    return AABB(x, y, z);
-}
-
-fn createAABB(a: vec3<f32>, b: vec3<f32>) -> AABB {
-    var x = createInterval(a.x, b.x);
-    var y = createInterval(a.y, b.y);
-    var z = createInterval(a.z, b.z);
-    if (a.x > b.x) {
-        x = createInterval(b.x, a.x);
-    }
-
-    if (a.y > b.y) {
-        y = createInterval(b.y, a.y);
-    }
-
-    if (a.z > b.z) {
-        z = createInterval(b.z, a.z);
-    }
-
-    return createAABBXYZ(x, y, z);
-}
-
-fn axisInterval(aabb: AABB, axis: u32) -> Interval {
-    if (axis == 1) {
-        return aabb.y;
-    }
-    if (axis == 2) {
-        return aabb.z;
-    }
-    return aabb.x;
-}
-
-fn hitAABB(aabb: AABB, r: Ray, t: Interval) -> bool {
-    var tmut = t;
-    for (var a = 0u; a < 3u; a++) {
-        let ax = axisInterval(aabb, a);
-        let axInv = 1.0 / r.direction[a];
-
-        let t0 = (ax.minI - r.origin[a]) * axInv;
-        let t1 = (ax.maxI - r.origin[a]) * axInv;
-
-        if (t0 < t1) {
-            if (t0 > tmut.minI) {
-                tmut.minI = t0;
-            }
-            if (t1 < tmut.maxI) {
-                tmut.maxI = t1;
-            }
-        } else {
-            if (t1 > tmut.minI) {
-                tmut.minI = t1;
-            }
-            if (t0 < tmut.maxI) {
-                tmut.maxI = t0;
-            }
-        }
-
-        if (tmut.maxI <= tmut.minI) {
-            return false;
-        }
-    }
-    return true;
-`;
-
-    const materialShader = `
-struct Material {
-    albedo: vec3<f32>,
-    fuzziness: f32,
-    refraction_index: f32,
-    mat_type: u32,
-}
-
-struct ScatterRecord {
-    scattered: Ray,
-    attenuation: vec3<f32>,
-    is_scattered: bool,
-}
-
-fn scatterLambertian(r: Ray, rec: HitRecord, material: Material, seed: vec2<u32>) -> ScatterRecord {
-    var scatter_direction = rec.normal + randUnitVector(seed);
-    if (nearZero(scatter_direction)) {
-        scatter_direction = rec.normal;
-    }
-    let scattered = Ray(rec.p, scatter_direction);
-    let attenuation = material.albedo;
-    return ScatterRecord(scattered, attenuation, true);
-}
-
-fn scatterMetal(r: Ray, rec: HitRecord, material: Material, seed: vec2<u32>) -> ScatterRecord {
-    let reflected = reflect(normalize(r.direction), rec.normal);
-    let scattered = Ray(rec.p, reflected + material.fuzziness * randInUnitSphere(seed));
-    let attenuation = material.albedo;
-    let is_scattered = dot(scattered.direction, rec.normal) > 0.0;
-    return ScatterRecord(scattered, attenuation, is_scattered);
-}
-
-fn scatterDielectric(r: Ray, rec: HitRecord, material: Material, seed: vec2<u32>) -> ScatterRecord {
-    let attenuation = vec3<f32>(1.0, 1.0, 1.0);
-    var refraction_ratio: f32;
-    if (rec.front_face) {
-        refraction_ratio = 1.0 / material.refraction_index;
-    } else {
-        refraction_ratio = material.refraction_index;
-    }
-
-    let unit_direction = normalize(r.direction);
-    let cos_theta = min(dot(-unit_direction, rec.normal), 1.0);
-    let sin_theta = sqrt(1.0 - cos_theta * cos_theta);
-    let cannot_refract = refraction_ratio * sin_theta > 1.0;
-    var direction: vec3<f32>;
-    if (cannot_refract || reflectance(cos_theta, refraction_ratio) > rand(seed)) {
-        direction = reflect(unit_direction, rec.normal);
-    } else {
-        direction = refract(unit_direction, rec.normal, refraction_ratio);
-    }
-
-    return ScatterRecord(Ray(rec.p, direction), attenuation, true);
-}
-`;
-
-    const hittableShapesShader = `
-struct Sphere {
-    center: vec3<f32>,
-    radius: f32,
-    material: Material,
-}
-
-struct HitRecord {
-    p: vec3<f32>,
-    normal: vec3<f32>,
-    t: f32,
-    hit: bool,
-    front_face: bool,
-    material: Material,
-}
-
-struct FaceNormalRecord {
-    front_face: bool,
-    normal: vec3<f32>,
-}
-
-fn setFaceNormal(rec: HitRecord, r: Ray, outwardNormal: vec3<f32>) -> FaceNormalRecord {
-    var newRec: FaceNormalRecord;
-    let frontFaceDirections = dot(r.direction, outwardNormal);
-    if (frontFaceDirections < 0.0) {
-        newRec.front_face = true;
-        newRec.normal = outwardNormal;
-    } else {
-        newRec.front_face = false;
-        newRec.normal = -outwardNormal;
-    }
-    return newRec;
-}
-
-fn hit_sphere(sphere: Sphere, r: Ray, ray_t: Interval) -> HitRecord {
-    var rec: HitRecord;
-    rec.hit = false;
-
-    let oc = sphere.center - r.origin;
-    let a = dot(r.direction, r.direction);
-    let h = dot(r.direction, oc);
-    let c = dot(oc, oc) - sphere.radius * sphere.radius;
-
-    let discriminant = h * h - a * c;
-    if (discriminant < 0.0) {
-        return rec;
-    }
-
-    let sqrtd = sqrt(discriminant);
-
-    // Find the nearest root that lies in the acceptable range.
-    var root = (h - sqrtd) / a;
-    if (!intervalContains(ray_t, root)) {
-        root = (h + sqrtd) / a;
-        if (!intervalContains(ray_t, root)) {
-            return rec;
-        }
-    }
-
-    rec.t = root;
-    rec.p = rayAt(r, rec.t);
-    rec.normal = (rec.p - sphere.center) / sphere.radius;
-    let faceNormalRec = setFaceNormal(rec, r, rec.normal);
-    rec.front_face = faceNormalRec.front_face;
-    rec.normal = faceNormalRec.normal;
-    rec.material = sphere.material;
-    rec.hit = true;
-
-    return rec;
-}
-
-fn hit_spheres(r: Ray, world: array<Sphere, NUM_SPHERES>, ray_t: Interval) -> HitRecord {
-    var closest_so_far = ray_t.maxI;
-    var rec: HitRecord;
-    rec.hit = false;
-
-    for (var i = 0u; i < NUM_SPHERES; i++) { 
-        let sphere_rec = hit_sphere(world[i], r, createInterval(ray_t.minI, closest_so_far));
-        if (sphere_rec.hit) {
-            closest_so_far = sphere_rec.t;
-            rec = sphere_rec;
-        }
-    }
-
-    return rec;
-}
-`;
-
-    const cameraShader = `
-struct Camera {
-    origin: vec3<f32>,
-    lower_left_corner: vec3<f32>,
-    horizontal: vec3<f32>,
-    vertical: vec3<f32>,
-    samples_per_pixel: u32,
-    vfov: f32,
-    lookfrom: vec3<f32>,
-    lookat: vec3<f32>,
-    vup: vec3<f32>,
-    defocus_angle: f32,
-    focus_distance: f32,
-    u: vec3<f32>,
-    v: vec3<f32>,
-    w: vec3<f32>,
-    defocus_disk_u: vec3<f32>,
-    defocus_disk_v: vec3<f32>,
-}
-
-fn createCamera(aspect_ratio: f32) -> Camera {
-    let samples_per_pixel: u32 = NUM_SAMPLES_PER_PIXEL;
-    let vfov = 20.0;
-    let lookfrom = vec3<f32>(13.0, 2.0, 3.0);
-    let lookat = vec3<f32>(0.0, 0.0, 0.0);
-    let vup = vec3<f32>(0.0, 1.0, 0.0);
-    let defocus_angle = 0.6;
-    let focus_distance = 15.0;
-
-    let theta = degreesToRadians(vfov);
-    let h = tan(theta / 2.0);
-    let viewport_height = 2.0 * h * focus_distance;
-    let viewport_width = aspect_ratio * viewport_height;
-
-    let w = normalize(lookfrom - lookat);
-    let u = normalize(cross(vup, w));
-    let v = cross(w, u);
-
-    let origin = lookfrom;
-    let horizontal = viewport_width * u;
-    let vertical = viewport_height * v;
-    let lower_left_corner = origin - horizontal / 2.0 - vertical / 2.0 - focus_distance * w;
-
-    let defocus_radius = focus_distance * tan(degreesToRadians(defocus_angle / 2.0));
-    let defocus_disk_u = u * defocus_radius;
-    let defocus_disk_v = v * defocus_radius;
-
-    return Camera(origin, lower_left_corner, horizontal, vertical, 
-                  samples_per_pixel, vfov, lookfrom, lookat, vup, 
-                  defocus_angle, focus_distance, u, v, w, defocus_disk_u, defocus_disk_v);
-}
-
-fn getRay(camera: Camera, s: f32, t: f32, seed: vec2<u32>) -> Ray {
-    var rd: vec3<f32> = camera.origin;  // This should be vec3<f32>(0.0, 0.0, 0.0)
-    if (camera.defocus_angle > 0.0) {
-        let p = randInUnitDisk(seed);
-        rd = (camera.defocus_disk_u * p.x + camera.defocus_disk_v * p.y);
-    }
-    let offset = camera.u * rd.x + camera.v * rd.y;
-    return Ray(
-        camera.origin + offset,
-        camera.lower_left_corner + s*camera.horizontal + t*camera.vertical - camera.origin - offset
-    );
-}
-`;
-    return constants + helpers + intervalShader + materialShader + hittableShapesShader + cameraShader + mainShaderCode;
-}
-
-function createComputeShader(device: GPUDevice, textureSize: { width: number, height: number }) {
-    const mainShaderCode = `
-            struct Ray {
-                origin: vec3<f32>,
-                direction: vec3<f32>
-            }
-
-            // const MATERIAL_GROUND: Material = Material(vec3<f32>(0.8, 0.8, 0.0), 0.0, 0.0, 0);
-            // const MATERIAL_CENTER: Material = Material(vec3<f32>(0.1, 0.2, 0.5), 0.0, 0.0, 0);
-            // const MATERIAL_LEFT: Material = Material(vec3<f32>(0.8, 0.8, 0.8), 0.0, 1.5, 2);
-            // const MATERIAL_BUBBLE: Material = Material(vec3<f32>(1.0, 1.0, 1.0), 0.0, 1.0/1.5, 2);
-            // const MATERIAL_RIGHT: Material = Material(vec3<f32>(0.8, 0.6, 0.2), 1.0, 0.0, 1);
-
-            // const spheres = array<Sphere, 5>(
-            //     Sphere(vec3<f32>(0.0, -100.5, -1.0), 100.0, MATERIAL_GROUND),
-            //     Sphere(vec3<f32>(0.0, 0.0, -1.2), 0.5, MATERIAL_CENTER),
-            //     Sphere(vec3<f32>(-1.0, 0.0, -1.0), 0.5, MATERIAL_LEFT),
-            //     Sphere(vec3<f32>(-1.0, 0.0, -1.0), 0.4, MATERIAL_BUBBLE),
-            //     Sphere(vec3<f32>(1.0, 0.0, -1.0), 0.5, MATERIAL_RIGHT)
-            // );
-
-            fn rayColor(initial_ray: Ray, world: array<Sphere, NUM_SPHERES>, seed: vec2<u32>) -> vec3<f32> {
-                var ray = initial_ray;
-                var color = vec3<f32>(1.0, 1.0, 1.0);
-                var current_seed = seed;
-                
-                for (var depth = 0u; depth < MAX_DEPTH; depth++) {
-                    if (depth == MAX_DEPTH - 1) {
-                        color *= 0.0;
-                    }
-                    let rec = hit_spheres(ray, world, createInterval(0.001, INFINITY));
-                    if (rec.hit) {
-                        current_seed = vec2<u32>(hash(current_seed), depth);
-
-                        let direction = rec.normal + randUnitVector(current_seed);
-
-                        var scatterRec: ScatterRecord;
-
-                        if (rec.material.mat_type == 0) {
-                            scatterRec = scatterLambertian(ray, rec, rec.material, current_seed);
-                        } else if (rec.material.mat_type == 1) {
-                            scatterRec = scatterMetal(ray, rec, rec.material, current_seed);
-                        } else if (rec.material.mat_type == 2) {
-                            scatterRec = scatterDielectric(ray, rec, rec.material, current_seed);
-                        } else {
-                            // Handle unknown material type
-                            return vec3<f32>(1.0, 0.0, 1.0); // Magenta for error
-                        }
-
-                        if (scatterRec.is_scattered) {
-                            ray = scatterRec.scattered;
-                            color *= scatterRec.attenuation;
-                        } else {
-                            return vec3<f32>(0.0, 0.0, 0.0); // Ray was absorbed
-                        }
-                    } else {
-                        let unit_direction = normalize(ray.direction);
-                        let a = 0.5 * (unit_direction.y + 1.0);
-                        color *= (1.0 - a) * vec3<f32>(1.0, 1.0, 1.0) + a * vec3<f32>(0.5, 0.7, 1.0);
-                        break;
-                    }
-                }
-                
-                return color;
-            }
-
-            fn rayAt(ray: Ray, t: f32) -> vec3<f32> {
-                return ray.origin + ray.direction * t;
-            }
-
-            fn createRandomScene() {
-                // Ground
-                spheres[0] = Sphere(
-                    vec3<f32>(0.0, -1000.0, 0.0),
-                    1000.0,
-                    Material(vec3<f32>(0.5, 0.5, 0.5), 0.0, 0.0, 0) // Lambertian
-                );
-
-                // Three large spheres
-                spheres[1] = Sphere(vec3<f32>(0.0, 1.0, 0.0), 1.0, Material(vec3<f32>(1.0), 0.0, 1.5, 2)); // Glass
-                spheres[2] = Sphere(vec3<f32>(-4.0, 1.0, 0.0), 1.0, Material(vec3<f32>(0.8, 0.1, 0.3), 0.0, 0.0, 0)); // Lambertian
-                spheres[3] = Sphere(vec3<f32>(4.0, 1.0, 0.0), 1.0, Material(vec3<f32>(0.7, 0.6, 0.5), 0.0, 0.0, 1)); // Metal
-
-                // Random small spheres
-                for (var i = 4u; i < NUM_SPHERES; i++) {
-                    let choose_mat = rand(vec2<u32>(i, 0u));
-                    let center = vec3<f32>(
-                        randMinMax(vec2<u32>(i, 1u), -4.0, 4.0),
-                        0.2,
-                        randMinMax(vec2<u32>(i, 2u), -4.0, 4.0)
-                    );
-
-                    if (length(center - vec3<f32>(4.0, 0.2, 0.0)) > 0.9) {
-                        if (choose_mat < 0.8) {
-                            // Diffuse
-                            let albedo = randVec3(vec2<u32>(i, 3u)) * randVec3(vec2<u32>(i, 4u));
-                            spheres[i] = Sphere(center, 0.2, Material(albedo, 0.0, 0.0, 0));
-                        } else if (choose_mat < 0.95) {
-                            // Metal
-                            let albedo = randVec3MinMax(vec2<u32>(i, 5u), 0.5, 1.0);
-                            let fuzz = randMinMax(vec2<u32>(i, 6u), 0.0, 0.5);
-                            spheres[i] = Sphere(center, 0.2, Material(albedo, fuzz, 0.0, 1));
-                        } else {
-                            // Glass
-                            spheres[i] = Sphere(center, 0.2, Material(vec3<f32>(1.0), 0.0, 1.5, 2));
-                        }
-                    } else {
-                        // If the position is not valid, create a default sphere
-                        spheres[i] = Sphere(vec3<f32>(0.0), 0.1, Material(vec3<f32>(1.0), 0.0, 0.0, 0));
-                    }
-                }
-            }
-
-
-            @group(0) @binding(0) var<storage, read_write> spheres: array<Sphere, NUM_SPHERES>;
-            @group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
-
-            @compute @workgroup_size(8, 8)
-            fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-                let dims = textureDimensions(output);
-                let coords = vec2<u32>(id.xy);
-                
-                if (coords.x >= dims.x || coords.y >= dims.y) {
-                    return;
-                }
-
-                let aspect_ratio = f32(dims.x) / f32(dims.y);
-                let camera = createCamera(aspect_ratio);
-                if (id.x == 0u && id.y == 0u) {
-                    createRandomScene();
-                }
-
-                var pixel_color = vec3<f32>(0.0, 0.0, 0.0);
-                for (var s = 0u; s < camera.samples_per_pixel; s++) {
-                    let seed = vec2<u32>(coords.x + dims.x * coords.y, s);
-                    let u = (f32(coords.x) + rand(seed)) / f32(dims.x);
-                    let v = (f32(coords.y) + rand(seed + vec2<u32>(1u, 1u))) / f32(dims.y); 
-                    let ray = getRay(camera, u, v, seed);
-                    pixel_color += rayColor(ray, spheres, seed);
-                }
-                
-                pixel_color = sqrt(pixel_color / f32(camera.samples_per_pixel)); // Gamma correction
-
-                textureStore(output, vec2<i32>(coords), vec4<f32>(pixel_color, 1.0));
-            }
-        `;
+function createComputeShader(device: GPUDevice, cellsBuffer: GPUBuffer, textureSize: any) {
     const module = device.createShaderModule({
-        label: "Compute shader",
-        code: buildShaderCode(mainShaderCode)
+        label: "Cellular Automata Compute Shader",
+        code: getComputeShaderCode(textureSize.width, textureSize.height)
     });
 
     const pipeline = device.createComputePipeline({
-        label: "Compute pipeline",
         layout: "auto",
         compute: {
             module,
             entryPoint: "main"
         }
     });
-
-    // After creating spheresBuffer
-    const sphereData = new Float32Array(properties.numSpheres * 12);
-
-    for (let i = 0; i < properties.numSpheres; i++) {
-        const offset = i * 12;
-        sphereData[offset] = 0; // center.x
-        sphereData[offset + 1] = 0; // center.y
-        sphereData[offset + 2] = 0; // center.z
-        sphereData[offset + 3] = 1; // radius
-        sphereData[offset + 4] = 1; // material.albedo.r
-        sphereData[offset + 5] = 1; // material.albedo.g
-        sphereData[offset + 6] = 1; // material.albedo.b
-        sphereData[offset + 7] = 0; // material.mat_type
-        sphereData[offset + 8] = 0; // material.fuzziness
-        sphereData[offset + 9] = 1; // material.refraction_index
-        // offset + 10 and offset + 11 are padding and can be left as 0
-    }
-
-    const spheresBuffer = device.createBuffer({
-        size: sphereData.byteLength,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-
-    device.queue.writeBuffer(spheresBuffer, 0, sphereData);
 
     const texture = device.createTexture({
         size: textureSize,
@@ -655,10 +251,9 @@ function createComputeShader(device: GPUDevice, textureSize: { width: number, he
     });
 
     const bindGroup = device.createBindGroup({
-        label: "Compute bind group",
         layout: pipeline.getBindGroupLayout(0),
         entries: [
-            { binding: 0, resource: { buffer: spheresBuffer } },
+            { binding: 0, resource: { buffer: cellsBuffer } },
             { binding: 1, resource: texture.createView() }
         ]
     });
@@ -666,34 +261,34 @@ function createComputeShader(device: GPUDevice, textureSize: { width: number, he
     return { pipeline, bindGroup, texture };
 }
 
-function createRenderPipeline(device: GPUDevice, format: GPUTextureFormat) {
+function createRenderPipeline(device: any, format: any) {
     const module = device.createShaderModule({
-        label: "Render shader",
+        label: "Render Shader",
         code: `
             struct VertexOutput {
                 @builtin(position) position: vec4<f32>,
                 @location(0) uv: vec2<f32>,
             }
 
-           @vertex
-           fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
-               var pos = array<vec2<f32>, 4>(
-                   vec2<f32>(-1.0, -1.0),
-                   vec2<f32>(1.0, -1.0),
-                   vec2<f32>(-1.0, 1.0),
-                   vec2<f32>(1.0, 1.0)
-               );
-               var uv = array<vec2<f32>, 4>(
-                   vec2<f32>(0.0, 0.0),  // Changed from (0.0, 1.0)
-                   vec2<f32>(1.0, 0.0),  // Changed from (1.0, 1.0)
-                   vec2<f32>(0.0, 1.0),  // Changed from (0.0, 0.0)
-                   vec2<f32>(1.0, 1.0)   // Changed from (1.0, 0.0)
-               );
-               var output: VertexOutput;
-               output.position = vec4<f32>(pos[vertexIndex], 0.0, 1.0);
-               output.uv = uv[vertexIndex];
-               return output;
-           } 
+            @vertex
+            fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+                var pos = array<vec2<f32>, 4>(
+                    vec2<f32>(-1.0, -1.0),
+                    vec2<f32>(1.0, -1.0),
+                    vec2<f32>(-1.0, 1.0),
+                    vec2<f32>(1.0, 1.0)
+                );
+                var uv = array<vec2<f32>, 4>(
+                    vec2<f32>(0.0, 1.0),
+                    vec2<f32>(1.0, 1.0),
+                    vec2<f32>(0.0, 0.0),
+                    vec2<f32>(1.0, 0.0)
+                );
+                var output: VertexOutput;
+                output.position = vec4<f32>(pos[vertexIndex], 0.0, 1.0);
+                output.uv = uv[vertexIndex];
+                return output;
+            } 
 
             @group(0) @binding(0) var textureSampler: sampler;
             @group(0) @binding(1) var inputTexture: texture_2d<f32>;
@@ -722,35 +317,78 @@ function createRenderPipeline(device: GPUDevice, format: GPUTextureFormat) {
         }
     });
 }
+//
+// function initializeCells(device: GPUDevice, width: number, height: number) {
+//     console.log("width", width, "height", height);
+//     const cellsData = new Uint32Array(width * height * 2);
+//     for (let i = 0; i < cellsData.length; i += 2) {
+//         if (Math.random() < properties.initialDensity) {
+//             cellsData[i] = Math.floor(Math.random() * (NUM_STATES - 1)) + 1;
+//         }
+//     }
+//
+//     const cellsBuffer = device.createBuffer({
+//         size: cellsData.byteLength,
+//         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+//     });
+//
+//     device.queue.writeBuffer(cellsBuffer, 0, cellsData);
+//     return cellsBuffer;
+// }
 
-var gui = new dat.GUI({ name: 'My GUI' });
-gui.useLocalStorage = true;
-var numSpheres = gui.add(properties, 'numSpheres', 1, 50).step(1);
-var numSamplesPerPixel = gui.add(properties, 'numSamplesPerPixel', 1, 64).step(1);
+var textureSize = { width: GRID_SIZE, height: GRID_SIZE };
 
 async function main() {
     const canvas = document.getElementById("canvas") as HTMLCanvasElement;
     const { device, context, presentationFormat } = await initWebGPU(canvas);
+    textureSize = {
+        width: Math.min(GRID_SIZE, canvas.width),
+        height: Math.min(GRID_SIZE, canvas.height)
+    };
 
-    // for now we will hardcode the canvas size
-    const width = WIDTH;
-    const aspectRation = 16.0 / 9.0;
-    const height = Math.floor(width / aspectRation);
-    canvas.width = Math.max(1, Math.min(width, device.limits.maxTextureDimension2D));
-    canvas.height = Math.max(1, Math.min(height, device.limits.maxTextureDimension2D));
-    let textureSize = { width: canvas.width, height: canvas.height };
+    // let cellsBuffer = initializeCells(device, textureSize.width, textureSize.height);
+    const cellsBuffer = device.createBuffer({
+        size: textureSize.width * textureSize.height * 8, // 2 u32s per cell
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
 
-    let computeShader = createComputeShader(device, textureSize);
+    let initComputeShader = createInitComputeShader(device, cellsBuffer, textureSize);
+    const commandEncoder = device.createCommandEncoder();
+    const initPass = commandEncoder.beginComputePass();
+    initPass.setPipeline(initComputeShader.initPipeline);
+    initPass.setBindGroup(0, initComputeShader.initBindGroup);
+    initPass.dispatchWorkgroups(Math.ceil(textureSize.width / 16), Math.ceil(textureSize.height / 16));
+    initPass.end();
+    device.queue.submit([commandEncoder.finish()]);
+
+    let computeShader = createComputeShader(device, cellsBuffer, textureSize);
     let renderPipeline = createRenderPipeline(device, presentationFormat);
 
     const sampler = device.createSampler({
         magFilter: "linear",
-        minFilter: "linear"
+        minFilter: "linear",
     });
 
-    let renderBindGroup: GPUBindGroup;
+    let renderBindGroup = device.createBindGroup({
+        layout: renderPipeline.getBindGroupLayout(0),
+        entries: [
+            { binding: 0, resource: sampler },
+            { binding: 1, resource: computeShader.texture.createView() }
+        ]
+    });
 
-    function updateBindGroups() {
+    function updateComputeShader(recreate = false) {
+        if (recreate) {
+            initComputeShader = createInitComputeShader(device, cellsBuffer, textureSize);
+            const commandEncoder = device.createCommandEncoder();
+            const initPass = commandEncoder.beginComputePass();
+            initPass.setPipeline(initComputeShader.initPipeline);
+            initPass.setBindGroup(0, initComputeShader.initBindGroup);
+            initPass.dispatchWorkgroups(Math.ceil(textureSize.width / 16), Math.ceil(textureSize.height / 16));
+            initPass.end();
+            device.queue.submit([commandEncoder.finish()]);
+        }
+        computeShader = createComputeShader(device, cellsBuffer, textureSize);
         renderBindGroup = device.createBindGroup({
             layout: renderPipeline.getBindGroupLayout(0),
             entries: [
@@ -760,22 +398,20 @@ async function main() {
         });
     }
 
-    updateBindGroups();
+    properties.reinitialize = () => updateComputeShader(true);
 
     function render() {
         const commandEncoder = device.createCommandEncoder();
 
-        // Run compute shader
         const computePass = commandEncoder.beginComputePass();
         computePass.setPipeline(computeShader.pipeline);
         computePass.setBindGroup(0, computeShader.bindGroup);
-        computePass.dispatchWorkgroups(Math.ceil(textureSize.width / 8), Math.ceil(textureSize.height / 8));
+        computePass.dispatchWorkgroups(Math.ceil(textureSize.width / 16), Math.ceil(textureSize.height / 16));
         computePass.end();
 
-        // Render to canvas
         const renderPass = commandEncoder.beginRenderPass({
             colorAttachments: [{
-                view: context.getCurrentTexture().createView(),
+                view: context!.getCurrentTexture().createView(),
                 loadOp: "clear",
                 storeOp: "store",
                 clearValue: { r: 0, g: 0, b: 0, a: 1 }
@@ -789,56 +425,59 @@ async function main() {
         device.queue.submit([commandEncoder.finish()]);
     }
 
-    // const observer = new ResizeObserver(entries => {
-    //     for (const entry of entries) {
-    //         const renderTime = performance.now();
-    //         const canvas = entry.target as HTMLCanvasElement;
-    //         canvas.width = Math.max(1, Math.min(width, device.limits.maxTextureDimension2D));
-    //         canvas.height = Math.max(1, Math.min(height, device.limits.maxTextureDimension2D));
-    //
-    //         // Update context configuration
-    //         context.configure({
-    //             device,
-    //             format: presentationFormat,
-    //             size: [canvas.width, canvas.height]
-    //         });
-    //
-    //         // Recreate compute shader with new size
-    //         textureSize = { width: canvas.width, height: canvas.height };
-    //         computeShader = createComputeShader(device, textureSize);
-    //
-    //         // Update bind groups
-    //         updateBindGroups();
-    //
-    //         // Re-render
-    //         render();
-    //         console.log("Rerender time:", performance.now() - renderTime);
-    //     }
-    // });
+    function animate() {
+        for (let i = 0; i < properties.evolutionSpeed; i++) {
+            render();
+        }
+        requestAnimationFrame(animate);
+    }
 
-    // observer.observe(canvas);
+    animate();
 
-    // Initial render
-    render();
+    // GUI setup
+    const gui = new dat.GUI();
+    gui.add(properties, 'evolutionSpeed', 1, 10).step(1);
+    gui.add(properties, 'initialDensity', 0, 1).step(0.05).onChange(() => updateComputeShader(true));
+    gui.add(properties, 'raysPerCell', 1, 32).step(1).onChange(() => updateComputeShader(true));
+    gui.add(properties, 'maxBounces', 1, 10).step(1).onChange(() => updateComputeShader(true));
+    gui.add(properties, 'reinitialize');
 
-    numSpheres.onChange((value: number) => {
-        properties.numSpheres = value;
-        computeShader = createComputeShader(device, textureSize);
-        updateBindGroups();
-        render();
+    // ResizeObserver setup
+    const observer = new ResizeObserver(entries => {
+        for (const entry of entries) {
+            const width = entry.devicePixelContentBoxSize?.[0].inlineSize ||
+                entry.contentBoxSize[0].inlineSize * devicePixelRatio;
+            const height = entry.devicePixelContentBoxSize?.[0].blockSize ||
+                entry.contentBoxSize[0].blockSize * devicePixelRatio;
+
+            canvas.width = Math.max(1, Math.min(width, device.limits.maxTextureDimension2D));
+            canvas.height = Math.max(1, Math.min(height, device.limits.maxTextureDimension2D));
+
+            // Update context configuration
+            context?.configure({
+                device,
+                format: presentationFormat,
+            });
+
+            // Update texture size
+            textureSize = {
+                width: Math.min(GRID_SIZE, canvas.width),
+                height: Math.min(GRID_SIZE, canvas.height)
+            };
+
+            // Recreate compute shader with new size
+            updateComputeShader(true);
+
+            // Re-render
+            render();
+        }
     });
 
-    numSamplesPerPixel.onChange((value: number) => {
-        properties.numSamplesPerPixel = value;
-        computeShader = createComputeShader(device, textureSize);
-        updateBindGroups();
-        render();
-    });
+    try {
+        observer.observe(canvas, { box: 'device-pixel-content-box' });
+    } catch {
+        observer.observe(canvas, { box: 'content-box' });
+    }
 }
 
-main().then(() =>
-    console.log("Total time:", performance.now() - renderTime)
-).catch(e => {
-    console.error(e);
-    alert(e);
-});
+main().catch(console.error);
