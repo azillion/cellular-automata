@@ -2,6 +2,8 @@ import "./style.css";
 // tsignore declaration error
 import * as dat from 'dat.gui';
 
+// TODO: how can we scale this up?
+
 const GRID_SIZE = 512;
 const NUM_STATES = 4;
 
