@@ -4,7 +4,7 @@ import * as dat from 'dat.gui';
 
 // TODO: how can we scale this up?
 
-const CELL_SIZE = 8;
+const CELL_SIZE = 8; // 8x8 pixels per cell
 const GRID_SIZE = 512;
 const NUM_STATES = 4;
 
