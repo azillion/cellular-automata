@@ -1,5 +1,4 @@
 import "./style.css";
-// tsignore declaration error
 import * as dat from 'dat.gui';
 
 // TODO: how can we scale this up?
